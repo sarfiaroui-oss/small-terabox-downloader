@@ -1,0 +1,1558 @@
+const DEFAULT_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9",
+  Accept: "application/json, text/plain, */*",
+};
+
+const TERABOX_DOMAINS = [
+  "www.terabox.com",
+  "www.1024terabox.com",
+  "1024terabox.com",
+  "terabox.com",
+  "teraboxapp.com",
+  "nephobox.com",
+  "mirrobox.com",
+  "momerybox.com",
+  "1024tera.com",
+  "dm.terabox.app",
+  "dm.1024tera.com",
+  "teraboxcdn.com",
+  "terabox.app",
+];
+
+const APP_ID = "250528";
+const VIDEO_EXTS = new Set([
+  "mp4", "mkv", "avi", "mov", "webm", "flv", "m4v", "wmv", "ts", "mpeg", "mpg",
+]);
+const IMAGE_EXTS = new Set([
+  "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "svg",
+]);
+const AUDIO_EXTS = new Set([
+  "mp3", "wav", "flac", "aac", "ogg", "m4a", "opus",
+]);
+
+const PASSWORD_PHRASES = [
+  "password required",
+  "wrong password",
+  "invalid password",
+  "incorrect password",
+  "need password",
+  "password protected",
+  "password error",
+  "password wrong",
+  "wrong pwd",
+  "invalid pwd",
+  "pwd invalid",
+  "pwd required",
+  "pwd wrong",
+];
+
+const PWD_ERRNO_DEFINITIVE = new Set([-130]);
+const PWD_ERRNO_AMBIGUOUS = new Set([-9, 105]);
+
+const VERIFY_ERRNO = new Set([400141, 4000020]);
+const VERIFY_PHRASES = [
+  "need verify",
+  "verify required",
+  "verification required",
+  "pi verify",
+];
+
+function humanSize(num) {
+  if (num == null) return null;
+  const n = Number(num);
+  if (isNaN(n)) return null;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = n;
+  for (const unit of units) {
+    if (Math.abs(v) < 1024) return `${v.toFixed(1)} ${unit}`;
+    v /= 1024;
+  }
+  return `${v.toFixed(1)} PB`;
+}
+
+function guessType(name) {
+  if (!name || !name.includes(".")) return null;
+  const ext = name.split(".").pop().toLowerCase();
+  if (VIDEO_EXTS.has(ext)) return "video";
+  if (IMAGE_EXTS.has(ext)) return "image";
+  if (AUDIO_EXTS.has(ext)) return "audio";
+  return "file";
+}
+
+function extractShareId(url) {
+  try {
+    const u = new URL(url);
+    const surl = u.searchParams.get("surl");
+    if (surl) return surl.replace(/^1/, "");
+    const m = u.pathname.match(/\/s\/1?([A-Za-z0-9_\-]+)/);
+    if (m) return m[1].replace(/^1/, "");
+    const m2 = url.match(/\/sharing\/link\?surl=([A-Za-z0-9_\-]+)/);
+    if (m2) return m2[1].replace(/^1/, "");
+  } catch { }
+  return null;
+}
+
+function extractStr(text, start, end) {
+  const si = text.indexOf(start);
+  if (si === -1) return null;
+  const ei = text.indexOf(end, si + start.length);
+  if (ei === -1) return null;
+  return text.slice(si + start.length, ei);
+}
+
+function extractToken(text, patterns) {
+  for (const pattern of patterns) {
+    const m = text.match(pattern);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function extractTokenAll(text, patterns) {
+  const results = [];
+  for (const pattern of patterns) {
+    let match;
+    const regex = new RegExp(pattern.source, pattern.flags + "g");
+    while ((match = regex.exec(text)) !== null) {
+      if (match[1] && match[1] !== "0") {
+        results.push(match[1]);
+      }
+    }
+  }
+  return results;
+}
+
+function isPasswordErrorText(text) {
+  if (!text) return false;
+  const lower = String(text).toLowerCase();
+  return PASSWORD_PHRASES.some((p) => lower.includes(p));
+}
+
+function normalizeErrno(errno) {
+  if (errno === null || errno === undefined || errno === "") return errno;
+  const n = Number(errno);
+  return Number.isNaN(n) ? errno : n;
+}
+
+function isVerificationErrorText(text) {
+  if (!text) return false;
+  const lower = String(text).toLowerCase();
+  return VERIFY_PHRASES.some((p) => lower.includes(p));
+}
+
+// TeraBox short-link paths carry a "1" prefix before the canonical short URL
+// (e.g. /s/1E6A5yMdGvczJJAoR3tTqpg), but the canonical short URL value used in
+// `surl=` query parameters must NOT include that leading "1"
+// (e.g. surl=E6A5yMdGvczJJAoR3tTqpg). Keep the two forms separate so we never
+// send "1<shorturl>" as a `surl` value.
+function canonicalShortUrl(surl) {
+  return String(surl || "").replace(/^1/, "");
+}
+
+function buildSharePageCandidates(domain, surl, password) {
+  const short = canonicalShortUrl(surl);
+  const pwdParam = password ? `&pwd=${encodeURIComponent(password)}` : "";
+  return [
+    `https://${domain}/sharing/link?surl=${short}${pwdParam}`,
+    `https://${domain}/s/${short}`,
+    `https://${domain}/s/1${short}`,
+  ];
+}
+
+// TeraBox sometimes answers the share-page request with a small JSON
+// verification/challenge body (e.g. {"errno":400141,"errmsg":"need verify"})
+// instead of the share HTML. Detect it explicitly so it is not misreported as a
+// normal page that merely lacks jsToken.
+function detectVerificationResponse(bodyText) {
+  if (!bodyText) return null;
+  const trimmed = String(bodyText).trim();
+  if (!trimmed.startsWith("{")) return null;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const errno = normalizeErrno(parsed.errno);
+  const errmsg = parsed.errmsg || parsed.error_msg || "";
+  if ((errno != null && VERIFY_ERRNO.has(errno)) || isVerificationErrorText(errmsg)) {
+    return { errno, errmsg };
+  }
+  return null;
+}
+
+function extractCookiePairs(setCookieHeader) {
+  if (!setCookieHeader) return [];
+  const pairs = [];
+  const parts = setCookieHeader.split(/,(?=\s*[A-Za-z0-9_\-]+=)/);
+  for (const part of parts) {
+    const eq = part.indexOf("=");
+    if (eq <= 0) continue;
+    const rest = part.slice(eq + 1);
+    const semi = rest.indexOf(";");
+    const value = (semi === -1 ? rest : rest.slice(0, semi)).trim();
+    const name = part.slice(0, eq).trim();
+    if (name) pairs.push(`${name}=${value}`);
+  }
+  return pairs;
+}
+
+function mergeCookieHeaders(cookieHeader, setCookieHeader) {
+  const map = new Map();
+  if (cookieHeader) {
+    for (const pair of cookieHeader.split(/;\s*/)) {
+      const p = pair.trim();
+      if (!p) continue;
+      map.set(p.split("=")[0].trim(), p);
+    }
+  }
+  for (const pair of extractCookiePairs(setCookieHeader)) {
+    map.set(pair.split("=")[0].trim(), pair);
+  }
+  return [...map.values()].join("; ");
+}
+
+const MAX_REDIRECTS = 5;
+
+async function fetchWithManualRedirects(startUrl, startCookie, headers, maxRedirects = MAX_REDIRECTS) {
+  let currentUrl = startUrl;
+  let mergedCookie = startCookie || "";
+  let resp = null;
+
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const cookieHeaders = mergedCookie ? { Cookie: mergedCookie } : {};
+    resp = await fetch(currentUrl, {
+      headers: { ...headers, ...cookieHeaders },
+      redirect: "manual",
+    });
+
+    const setCookie = resp.headers.get("set-cookie");
+    if (setCookie) {
+      mergedCookie = mergeCookieHeaders(mergedCookie, setCookie);
+    }
+
+    if (resp.status >= 300 && resp.status < 400) {
+      const location = resp.headers.get("location");
+      if (!location) {
+        break;
+      }
+      currentUrl = new URL(location, currentUrl).toString();
+      continue;
+    }
+
+    break;
+  }
+
+  const html = resp ? await resp.text().catch(() => "") : "";
+  return {
+    finalUrl: currentUrl,
+    html,
+    mergedCookie,
+    status: resp ? resp.status : 0,
+  };
+}
+
+function redactTokenLike(text) {
+  return String(text)
+    .replace(/(csrfToken|browserid|TSID|ndus|pcftoken|bdstoken|sign|timestamp|shareid|rand|dp-logid|yjs_nuo[^=]*)\s*=\s*["']?[^"'\s;&<,]+/gi, "$1=REDACTED")
+    .replace(/jsToken\s*=\s*fn\s*\(\s*["']([^"']+)["']\s*\)/gi, 'jsToken=REDACTED')
+    .replace(/jsToken\s*=\s*["']([^"']+)["']/gi, 'jsToken=REDACTED')
+    .replace(/[A-Za-z0-9_\-%]{32,}/g, "REDACTED");
+}
+
+function sanitizeQueryString(text) {
+  return String(text)
+    .replace(/(csrfToken|browserid|TSID|ndus|pcftoken|bdstoken|sign|timestamp|shareid|uk|dp-logid|jsToken|pwd)=[^&]+/gi, "$1=REDACTED");
+}
+
+function logRequest(label, url, opts = {}) {
+  const log = {
+    event: "request",
+    label,
+    url,
+    method: opts.method || "GET",
+    timestamp: new Date().toISOString(),
+  };
+  if (opts.params) log.params = sanitizeQueryString(opts.params);
+  if (opts.body) log.body = sanitizeQueryString(opts.body);
+  console.log(JSON.stringify(log));
+}
+
+function logResponse(label, url, status, data, opts = {}) {
+  const log = {
+    event: "response",
+    label,
+    url,
+    status,
+    errno: data?.errno ?? null,
+    errmsg: data?.errmsg ?? data?.error_msg ?? null,
+    timestamp: new Date().toISOString(),
+  };
+  if (opts.logRaw && data) {
+    const sanitized = { ...data };
+    if (sanitized.list && sanitized.list.length > 3) {
+      sanitized.list = sanitized.list.slice(0, 3).concat([{ _truncated: sanitized.list.length - 3 }]);
+    }
+    log.raw_json = sanitized;
+  }
+  console.log(JSON.stringify(log));
+}
+
+async function fetchSharePage(surl, password, cookieHeader) {
+  let sawVerification = false;
+
+  const SIGN_PATTERNS = [
+    /[?&](?:amp;)?sign=([^&"'\s<>]+)/i,
+    /window\.sign\s*=\s*["']([^"']+)["']/,
+    /"sign"\s*:\s*"([^"]+)"/,
+    /'sign'\s*:\s*'([^']+)'/,
+    /sign%22%3A%22([^%]+)%22/,
+  ];
+  const TIMESTAMP_PATTERNS = [
+    /[?&](?:amp;)?time=(\d+)/i,
+    /window\.timestamp\s*=\s*["']?(\d+)["']?/,
+    /"timestamp"\s*:\s*(\d+)/,
+    /'timestamp'\s*:\s*'(\d+)'/,
+  ];
+  const SHAREID_PATTERNS = [
+    /"share_id"\s*:\s*"(\d+)"/,
+    /'share_id'\s*:\s*'(\d+)'/,
+    /window\.shareid\s*=\s*["']?(\d+)["']?/,
+    /"shareid"\s*:\s*(\d+)/,
+    /'shareid'\s*:\s*'(\d+)'/,
+    /shareid%22%3A(\d+)/,
+  ];
+  const UK_PATTERNS = [
+    /"uk"\s*:\s*"(\d+)"/,
+    /'uk'\s*:\s*'(\d+)'/,
+    /window\.uk\s*=\s*["']?(\d+)["']?/,
+    /uk%22%3A(\d+)/,
+  ];
+  const BDSTOKEN_PATTERNS = [
+    /"bdstoken"\s*:\s*"([^"]+)"/,
+    /'bdstoken'\s*:\s*'([^']+)'/,
+    /window\.bdstoken\s*=\s*["']([^"']+)["']/,
+    /bdstoken%22%3A%22([^%]+)%22/,
+  ];
+  const SHORTURL_PATTERNS = [
+    /window\.shorturl\s*=\s*["']([^"']+)["']/,
+    /"shorturl"\s*:\s*"([^"]+)"/,
+    /'shorturl'\s*:\s*'([^']+)'/,
+  ];
+
+  for (const domain of TERABOX_DOMAINS) {
+    const urls = buildSharePageCandidates(domain, surl, password);
+    for (const url of urls) {
+        try {
+          logRequest("fetch_share_page", url);
+
+          const hopOne = await fetchWithManualRedirects(url, cookieHeader, { ...DEFAULT_HEADERS });
+          const hopTwo = await fetchWithManualRedirects(hopOne.finalUrl, hopOne.mergedCookie, { ...DEFAULT_HEADERS });
+
+          logResponse("fetch_share_page", hopTwo.finalUrl, hopTwo.status, {});
+          const pageCookie = hopTwo.mergedCookie || null;
+
+          if (hopTwo.status !== 200) continue;
+          const html = hopTwo.html;
+          const finalUrl = hopTwo.finalUrl;
+
+          // TeraBox can answer with a small JSON verification/challenge body
+          // (e.g. {"errno":400141,"errmsg":"need verify"}) instead of the share
+          // HTML. Treat it as a verification response — never as a page that
+          // merely lacks jsToken.
+          const verification = detectVerificationResponse(html);
+          if (verification) {
+            sawVerification = true;
+            console.log(JSON.stringify({
+              event: "fetch_share_page_verification_required",
+              responseUrl: sanitizeQueryString(finalUrl),
+              status: hopTwo.status,
+              errno: verification.errno,
+              errmsg: verification.errmsg,
+            }));
+            continue;
+          }
+
+          // jsToken extraction — reference-consistent (tbx-proxy/src/utils.js extractJsToken).
+          // Legacy precedence is kept ONLY as a fallback; no token values are ever logged.
+          const referenceJsTokenRegex = /fn(?:%28|\()(?:%22|%27|["'])([^%'"\(\)]+)(?:%22|%27|["'])(?:%29|\))/;
+
+          const extractJsTokenLegacy = (htmlText) => {
+            let t = extractStr(htmlText, "fn%28%22", "%22%29");
+            if (!t) t = extractStr(htmlText, "fn(", '"');
+            if (!t) {
+              const m2 = htmlText.match(/window\.jsToken[^=]*=\s*fn\s*\(\s*["']([^"']+)["']/);
+              if (m2) t = m2[1];
+            }
+            if (!t) {
+              const m2 = htmlText.match(referenceJsTokenRegex);
+              if (m2) t = m2[1];
+            }
+            return t;
+          };
+
+          const extractJsTokenReference = (htmlText) => {
+            const candidates = [];
+            const re = new RegExp(referenceJsTokenRegex.source, "g");
+            let m;
+            while ((m = re.exec(htmlText)) !== null) candidates.push(m[1]);
+            return candidates;
+          };
+
+          const legacyToken = extractJsTokenLegacy(html);
+          const referenceCandidates = extractJsTokenReference(html);
+          const referenceToken = referenceCandidates[0] || null;
+          const jsToken = referenceToken || legacyToken;
+
+          console.log(JSON.stringify({
+            event: "jsToken_extraction_compare",
+            currentFound: !!legacyToken,
+            referenceCandidateCount: referenceCandidates.length,
+            currentLength: legacyToken ? legacyToken.length : 0,
+            candidateLengths: referenceCandidates.map((c) => c.length),
+            sameSelection: !!legacyToken && legacyToken === referenceToken,
+          }));
+
+          // Extract modern TeraBox tokens
+          const sign = extractToken(html, SIGN_PATTERNS);
+          const timestamp = extractToken(html, TIMESTAMP_PATTERNS);
+          const shareid = extractToken(html, SHAREID_PATTERNS);
+          let uk = extractToken(html, UK_PATTERNS);
+          if (uk === "0") {
+            const ukCandidates = extractTokenAll(html, UK_PATTERNS);
+            if (ukCandidates.length > 0) {
+              uk = ukCandidates[0];
+            }
+          }
+          const bdstoken = extractToken(html, BDSTOKEN_PATTERNS);
+          const shorturl = extractToken(html, SHORTURL_PATTERNS);
+
+          // [TEMP-DIAG] Structural analysis of live HTML for token extraction debugging
+          function analyzeTokenInHtml(html, label, patterns) {
+            const results = [];
+            for (const pattern of patterns) {
+              const regex = new RegExp(pattern.source, pattern.flags + "g");
+              let match;
+              while ((match = regex.exec(html)) !== null) {
+                const start = Math.max(0, match.index - 40);
+                const end = Math.min(html.length, match.index + match[0].length + 40);
+                const context = html.slice(start, end);
+                results.push({
+                  pattern: pattern.source.slice(0, 60),
+                  matched: match[0].slice(0, 80),
+                  valueLength: match[1] ? match[1].length : 0,
+                  context: redactTokenLike(context),
+                });
+              }
+            }
+            return results;
+          }
+
+          console.log("AUTH_KEYWORDS:", (html.match(/.{0,60}(sign|timestamp|shareid|share_id|uk|bdstoken|jsToken|logid|dp-logid|shorturl).{0,120}/gi) || []).slice(0,30).map(x => redactTokenLike(x)));
+          const signStruct = analyzeTokenInHtml(html, "sign", SIGN_PATTERNS);
+          const timestampStruct = analyzeTokenInHtml(html, "timestamp", TIMESTAMP_PATTERNS);
+          const shareidStruct = analyzeTokenInHtml(html, "shareid", SHAREID_PATTERNS);
+          const ukStruct = analyzeTokenInHtml(html, "uk", UK_PATTERNS);
+          const bdstokenStruct = analyzeTokenInHtml(html, "bdstoken", BDSTOKEN_PATTERNS);
+
+          console.log(JSON.stringify({
+            event: "token_structure_diag",
+            domain,
+            htmlLength: html.length,
+            sign: { found: sign !== null, candidates: signStruct.length, details: signStruct.slice(0, 5) },
+            timestamp: { found: timestamp !== null, candidates: timestampStruct.length, details: timestampStruct.slice(0, 5) },
+            shareid: { found: shareid !== null, candidates: shareidStruct.length, details: shareidStruct.slice(0, 5) },
+            uk: { found: uk !== null && uk !== "0", candidates: ukStruct.length, details: ukStruct.slice(0, 5) },
+            bdstoken: { found: bdstoken !== null, candidates: bdstokenStruct.length, details: bdstokenStruct.slice(0, 5) },
+          }));
+
+          if (!jsToken) {
+            const lowerHtml = html.toLowerCase();
+            console.log(JSON.stringify({
+              event: "fetch_share_page_no_jsToken",
+              responseUrl: finalUrl,
+              status: hopTwo.status,
+              htmlLength: html.length,
+              containsJsToken: html.includes("jsToken"),
+              containsFnEncoded: html.includes("fn%28%22"),
+              containsTemplateData: html.includes("templateData"),
+              containsCaptcha: lowerHtml.includes("captcha"),
+              htmlPreview: redactTokenLike(html.slice(0, 300)),
+            }));
+            continue;
+          }
+
+          const parsedUrl = new URL(finalUrl);
+          const extractedSurl = parsedUrl.searchParams.get("surl") || surl;
+
+          const dpLogid = extractStr(html, "dp-logid=", "&") || "";
+          const ogTitle =
+            extractStr(html, 'og:title" content="', '"') ||
+            extractStr(html, "og:title' content='", "'") ||
+            html.match(/<title>([^<]+)<\/title>/)?.[1]?.trim() ||
+            null;
+          const ogImage =
+            extractStr(html, 'og:image" content="', '"') ||
+            extractStr(html, "og:image' content='", "'") ||
+            null;
+
+          console.log(JSON.stringify({
+            event: "tokens_extracted",
+            domain,
+            hasJsToken: !!jsToken,
+            jsTokenLength: jsToken ? jsToken.length : 0,
+            hasSign: !!sign,
+            shareid,
+            uk,
+            timestamp,
+            hasBdstoken: !!bdstoken,
+          }));
+
+          return {
+            jsToken,
+            sign,
+            timestamp,
+            shareid,
+            uk,
+            bdstoken,
+            shorturl,
+            surl: extractedSurl.replace(/^1/, ""),
+            dpLogid,
+            ogTitle,
+            ogImage,
+            domain,
+            pageCookie,
+          };
+        } catch (err) {
+          logResponse("fetch_share_page", url, 0, { error: err.message });
+          continue;
+        }
+      }
+    }
+
+  if (sawVerification) {
+    return {
+      error: "verification_required",
+      verification_required: true,
+      ogTitle: null,
+      ogImage: null,
+    };
+  }
+
+  return null;
+}
+
+const MAX_UNKNOWN_ERROR_BODY = 3000;
+
+function sanitizeDiagnosticBody(text) {
+  let out = String(text);
+  const secretKeys = [
+    "jsToken", "ndus", "bdstoken", "browserid", "TSID", "csrfToken",
+    "ndut_fmt", "ndut_fmv", "uk", "sign", "timestamp", "shareid",
+    "dp-logid", "authorization", "cookies",
+  ];
+  for (const key of secretKeys) {
+    const re = new RegExp(
+      `([^a-zA-Z0-9_]|^)(?:["']?)${key}(?:["']?)\\s*[:=]\\s*["']?[^"',;&\\s}<]+`,
+      "gi"
+    );
+    out = out.replace(re, `$1${key}=REDACTED`);
+  }
+  out = out.replace(/eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+/g, "REDACTED");
+  return redactTokenLike(out);
+}
+
+function logShareListUnknownError({ variant, domain, status, errno, errmsg, bodyText, isJson, parsedBody }) {
+  const bodyStr = String(bodyText || "");
+  const responseKeys =
+    isJson && parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
+      ? Object.keys(parsedBody)
+      : [];
+  console.log(JSON.stringify({
+    event: "share_list_unknown_error",
+    variant,
+    domain,
+    status,
+    errno,
+    errmsg: errmsg || null,
+    responseType: isJson ? "json" : "text",
+    responseLength: bodyStr.length,
+    responseKeys,
+    sanitizedBody: sanitizeDiagnosticBody(bodyStr.slice(0, MAX_UNKNOWN_ERROR_BODY)),
+  }));
+}
+
+async function callShareList(tokens, cookieHeader, cookieNamesSet) {
+  const hasCookie = !!cookieHeader;
+  const hasJsToken = !!tokens.jsToken;
+  const hasDpLogid = !!tokens.dpLogid;
+  const cookieNames = cookieNamesSet || new Set();
+
+  const endpoint = "https://dm.terabox.app/share/list";
+
+  const buildParams = () => {
+    const params = new URLSearchParams();
+    params.set("jsToken", tokens.jsToken);
+    params.set("shorturl", tokens.surl);
+    params.set("root", "1");
+    return params;
+  };
+
+  const buildHeaders = (withCookie) => {
+    const headers = {
+      "User-Agent": DEFAULT_HEADERS["User-Agent"],
+      Accept: "application/json",
+      Referer: "https://terabox.com/",
+    };
+    if (withCookie && cookieHeader) headers.Cookie = cookieHeader;
+    return headers;
+  };
+
+  let lastErrno = null;
+  let lastErrmsg = null;
+  let lastStatus = null;
+  let listIsArray = false;
+  let listLength = 0;
+  let anonymousRetried = false;
+  let anonymousErrno = null;
+  let anonymousErrmsg = null;
+
+  async function attempt(label, withCookie) {
+    const params = buildParams();
+    logRequest("share_list", endpoint, { variant: label, params: params.toString() });
+    const resp = await fetch(`${endpoint}?${params.toString()}`, {
+      headers: buildHeaders(withCookie),
+    });
+    lastStatus = resp.status;
+
+    if (resp.status !== 200) {
+      logResponse("share_list", resp.url, resp.status, { http_status: resp.status });
+      console.log(JSON.stringify({
+        event: "share_list_variant",
+        variant: label,
+        domain: endpoint,
+        status: resp.status,
+        errno: null,
+        errmsg: null,
+        listPresent: false,
+        listLength: null,
+      }));
+      return { errno: null, errmsg: null, httpStatus: resp.status };
+    }
+
+    let data;
+    let rawText;
+    let bodyIsJson = false;
+    try { rawText = await resp.text(); } catch { return { errno: null, errmsg: null, httpStatus: resp.status }; }
+    try { data = JSON.parse(rawText); bodyIsJson = true; } catch { data = null; }
+
+    if (!bodyIsJson) {
+      logShareListUnknownError({
+        variant: label,
+        domain: endpoint,
+        status: resp.status,
+        errno: null,
+        errmsg: null,
+        bodyText: rawText,
+        isJson: false,
+        parsedBody: null,
+      });
+      return { errno: null, errmsg: null, httpStatus: resp.status };
+    }
+
+    const en = normalizeErrno(data.errno);
+    const errmsg = data.errmsg || data.error_msg || "";
+    const listPresent = Array.isArray(data.list) && data.list.length > 0;
+
+    console.log(JSON.stringify({
+      event: "share_list_variant",
+      variant: label,
+      domain: endpoint,
+      status: resp.status,
+      errno: en,
+      errmsg: errmsg || null,
+      listPresent,
+      listLength: Array.isArray(data.list) ? data.list.length : null,
+    }));
+
+    if (en === 0 && listPresent) {
+      listIsArray = Array.isArray(data.list);
+      listLength = data.list.length;
+      return { data };
+    }
+
+    if (en === 0) {
+      return { errno: 0, errmsg: "empty list" };
+    }
+
+    if (VERIFY_ERRNO.has(en) || isVerificationErrorText(errmsg)) {
+      return { error: "verification_required", verification_required: true, errno: en, errmsg };
+    }
+
+    if (PWD_ERRNO_DEFINITIVE.has(en)) {
+      return { error: "password_required", password_required: true, errno: en, errmsg };
+    }
+
+    if (PWD_ERRNO_AMBIGUOUS.has(en) && isPasswordErrorText(errmsg)) {
+      return { error: "password_required", password_required: true, errno: en, errmsg };
+    }
+
+    logShareListUnknownError({
+      variant: label,
+      domain: endpoint,
+      status: resp.status,
+      errno: en,
+      errmsg: errmsg || "unknown error",
+      bodyText: rawText,
+      isJson: true,
+      parsedBody: data,
+    });
+
+    return { errno: en, errmsg: errmsg || "unknown error" };
+  }
+
+  const buildDiag = () => ({
+    domain: endpoint,
+    hasCookie,
+    hasJsToken,
+    hasDpLogid,
+    referer: "https://terabox.com/",
+    hasXRequestedWith: false,
+    status: lastStatus,
+    errno: lastErrno,
+    listIsArray,
+    listLength,
+    cookieCount: cookieNames.size,
+    cookieNames: Array.from(cookieNames),
+    anonymousRetried,
+    anonymousErrno,
+    anonymousErrmsg,
+  });
+
+  try {
+    const primary = await attempt("minimal", true);
+
+    if (primary?.data) return primary;
+    if (primary?.error === "verification_required" || primary?.error === "password_required") return primary;
+
+    const primaryErrno = normalizeErrno(primary?.errno);
+
+    if (primaryErrno === 140) {
+      anonymousRetried = true;
+      console.log(JSON.stringify({
+        event: "share_list_anonymous_retry",
+        reason: "errno=140",
+        cookieRemoved: true,
+      }));
+
+      const anon = await attempt("minimal-anonymous", false);
+      if (anon?.data) return anon;
+      if (anon?.error === "verification_required" || anon?.error === "password_required") return anon;
+
+      anonymousErrno = normalizeErrno(anon?.errno) ?? null;
+      anonymousErrmsg = anon?.errmsg ?? null;
+      lastErrno = anon.errno != null ? anon.errno : primaryErrno;
+      lastErrmsg = anon.errmsg || primary.errmsg || "unknown error";
+    } else if (primaryErrno === 0) {
+      lastErrno = 0;
+      lastErrmsg = "empty list";
+    } else if (primaryErrno != null) {
+      lastErrno = primaryErrno;
+      lastErrmsg = primary.errmsg || "unknown error";
+    } else {
+      lastErrmsg = "share/list request failed";
+    }
+  } catch (err) {
+    logResponse("share_list", endpoint, 0, { error: err.message });
+    return { error: "api_error", errno: lastErrno, errmsg: err.message, _diagnostic: buildDiag() };
+  }
+
+  return { error: "api_error", errno: lastErrno, errmsg: lastErrmsg || "share/list request failed", _diagnostic: buildDiag() };
+}
+
+async function callShareListWithVerificationRetry(tokens, cookieHeader, cookieNamesSet) {
+  let result = await callShareList(tokens, cookieHeader, cookieNamesSet);
+
+  const errno = normalizeErrno(result?.errno);
+  const verificationDetected =
+    result?.verification_required === true ||
+    (errno != null && VERIFY_ERRNO.has(errno));
+
+  if (verificationDetected) {
+    console.log(JSON.stringify({
+      event: "share_list_verification_retry",
+      reason: result?.verification_required ? "verification_required" : `errno=${errno}`,
+      cookieRemoved: true,
+    }));
+    result = await callShareList(tokens, "", new Set());
+  }
+
+  return result;
+}
+
+async function callGetInfo(tokens, cookieHeader) {
+  // Alternative API endpoint
+  const params = new URLSearchParams({
+    app_id: APP_ID,
+    web: "1",
+    channel: "dubox",
+    clienttype: "0",
+    clientfrom: "h5",
+    psign: "0",
+    shorturl: tokens.surl,
+  });
+  if (tokens.sign) params.set("sign", tokens.sign);
+  if (tokens.timestamp) params.set("timestamp", tokens.timestamp);
+  if (tokens.shareid) params.set("shareid", tokens.shareid);
+  if (tokens.uk) params.set("uk", tokens.uk);
+  if (tokens.bdstoken) params.set("bdstoken", tokens.bdstoken);
+
+  const cookieHeaders = cookieHeader ? { Cookie: cookieHeader } : {};
+
+  const apiDomains = [
+    `https://${tokens.domain}/share/list`,
+    "https://www.terabox.com/share/list",
+    "https://www.1024tera.com/share/list",
+  ];
+
+  for (const domain of apiDomains) {
+    try {
+      logRequest("get_info", domain, { params: params.toString() });
+      const resp = await fetch(`${domain}?${params.toString()}`, {
+        headers: {
+          ...DEFAULT_HEADERS,
+          Referer: `https://${tokens.domain}/sharing/link?surl=${tokens.surl}`,
+          ...cookieHeaders,
+        },
+      });
+      if (resp.status !== 200) continue;
+      const data = await resp.json();
+      logResponse("get_info", resp.url, resp.status, data, { logRaw: true });
+
+      const en = normalizeErrno(data.errno);
+      const errmsg = data.errmsg || data.error_msg || "";
+
+      if (en === 0) {
+        if (data.list && data.list.length) {
+          return { data };
+        }
+      }
+
+      if (VERIFY_ERRNO.has(en) || isVerificationErrorText(errmsg)) {
+        return { error: "verification_required", verification_required: true, errno: en, errmsg };
+      }
+      if (PWD_ERRNO_DEFINITIVE.has(en)) {
+        return { error: "password_required", password_required: true, errno: en, errmsg };
+      }
+      if (PWD_ERRNO_AMBIGUOUS.has(en) && isPasswordErrorText(errmsg)) {
+        return { error: "password_required", password_required: true, errno: en, errmsg };
+      }
+    } catch { }
+  }
+  return null;
+}
+
+async function callGetDownload(tokens, fsId, cookieHeader) {
+  // Download API to get direct dlink using modern tokens
+  const apiDomains = [
+    `https://${tokens.domain}/api/download`,
+    "https://www.terabox.com/api/download",
+    "https://www.1024tera.com/api/download",
+  ];
+
+  const cookieHeaders = cookieHeader ? { Cookie: cookieHeader } : {};
+
+  for (const domain of apiDomains) {
+    try {
+      const body = new URLSearchParams({
+        app_id: APP_ID,
+        web: "1",
+        channel: "dubox",
+        clienttype: "0",
+        jsToken: tokens.jsToken,
+        shareid: tokens.shareid || "",
+        uk: tokens.uk || "",
+        sign: tokens.sign || "",
+        timestamp: tokens.timestamp || "",
+        fs_id: fsId,
+        bdstoken: tokens.bdstoken || "",
+      });
+
+      logRequest("get_download", domain, { fs_id: fsId });
+      const resp = await fetch(domain, {
+        method: "POST",
+        headers: {
+          ...DEFAULT_HEADERS,
+          "Content-Type": "application/x-www-form-urlencoded",
+          Referer: `https://${tokens.domain}/sharing/link?surl=${tokens.surl}`,
+          ...cookieHeaders,
+        },
+        body: body.toString(),
+      });
+      if (resp.status !== 200) continue;
+      const data = await resp.json();
+      logResponse("get_download", resp.url, resp.status, data, { logRaw: true });
+
+      const en = normalizeErrno(data.errno);
+      const errmsg = data.errmsg || data.error_msg || "";
+
+      if (en === 0) {
+        if (data.dlink || data.download_link || data.url) {
+          return { dlink: data.dlink || data.download_link || data.url };
+        }
+      }
+
+      if (VERIFY_ERRNO.has(en) || isVerificationErrorText(errmsg)) {
+        return { error: "verification_required", verification_required: true, errno: en, errmsg };
+      }
+      if (PWD_ERRNO_DEFINITIVE.has(en)) {
+        return { error: "password_required", password_required: true, errno: en, errmsg };
+      }
+      if (PWD_ERRNO_AMBIGUOUS.has(en) && isPasswordErrorText(errmsg)) {
+        return { error: "password_required", password_required: true, errno: en, errmsg };
+      }
+    } catch { }
+  }
+  return null;
+}
+
+async function resolveDlink(dlink, cookieHeader) {
+  const cookieHeaders = cookieHeader ? { Cookie: cookieHeader } : {};
+  try {
+    logRequest("resolve_dlink", dlink);
+    const resp = await fetch(dlink, {
+      method: "HEAD",
+      headers: {
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        Referer: "https://www.terabox.com/",
+        ...cookieHeaders,
+      },
+      redirect: "follow",
+    });
+    logResponse("resolve_dlink", resp.url, resp.status, {});
+    if (resp.status < 400) return resp.url;
+
+    const resp2 = await fetch(dlink, {
+      method: "GET",
+      headers: {
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        Referer: "https://www.terabox.com/",
+        ...cookieHeaders,
+      },
+      redirect: "follow",
+    });
+    logResponse("resolve_dlink", resp2.url, resp2.status, {});
+    if (resp2.status < 400) return resp2.url;
+  } catch (err) {
+    logResponse("resolve_dlink", dlink, 0, { error: err.message });
+  }
+  return dlink;
+}
+
+function normalizeFile(item, tokens) {
+  const name = item.server_filename || item.filename || "Unknown";
+  const size = parseInt(item.size, 10) || null;
+  const thumbs = item.thumbs || {};
+  const thumbnail = thumbs.url3 || thumbs.url2 || thumbs.url1 || tokens.ogImage;
+  const dlink = item.dlink || "";
+  const isDir = item.isdir === "1";
+
+  return {
+    name,
+    size,
+    size_str: humanSize(size),
+    duration: null,
+    resolution: null,
+    thumbnail,
+    download_url: dlink,
+    stream_url: dlink,
+    file_type: guessType(name),
+    isdir: isDir,
+    path: item.path || "",
+    fs_id: item.fs_id || "",
+  };
+}
+
+function extractCookieNames(cookieJson) {
+  const names = new Set();
+  let cookieHeader = "";
+
+  if (!cookieJson) {
+    return { names, cookieHeader, cookieCount: 0 };
+  }
+
+  if (cookieJson.trim().startsWith("{")) {
+    try {
+      const parsed = JSON.parse(cookieJson);
+
+      if (typeof parsed === "object" && parsed !== null) {
+        const parts = [];
+
+        for (const [key, value] of Object.entries(parsed)) {
+          names.add(key);
+
+          if (value !== undefined && value !== null && String(value) !== "") {
+            parts.push(`${key}=${String(value)}`);
+          }
+        }
+
+        cookieHeader = parts.join("; ");
+      }
+    } catch {}
+  } else {
+    for (const part of cookieJson.split(";")) {
+      const trimmed = part.trim();
+      const eq = trimmed.indexOf("=");
+
+      if (eq > 0) {
+        names.add(trimmed.slice(0, eq).trim());
+      }
+    }
+
+    cookieHeader = cookieJson.trim();
+  }
+
+  return {
+    names,
+    cookieHeader,
+    cookieCount: names.size,
+  };
+}
+
+async function handleExtract(url, password, cookieJson) {
+  const surl = extractShareId(url);
+  if (!surl) {
+    return { ok: false, source: "cf_worker", error: "Could not extract share ID from URL" };
+  }
+
+  const { names: cookieNames, cookieHeader: initialCookieHeader, cookieCount } = extractCookieNames(cookieJson);
+  let cookieHeader = initialCookieHeader;
+
+  const tokens = await fetchSharePage(surl, password, cookieHeader);
+  if (!tokens) {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: "Could not fetch TeraBox share page or extract authentication tokens.",
+    };
+  }
+
+  if (tokens.error === "verification_required") {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: "TeraBox requires verification to access this link.",
+      verification_required: true,
+      title: tokens.ogTitle || "Verification required",
+      size: null,
+      size_str: null,
+      duration: null,
+      resolution: null,
+      thumbnail: tokens.ogImage,
+      download_url: null,
+      stream_url: null,
+      file_type: null,
+      files: [],
+    };
+  }
+
+  if (tokens.error === "password_required") {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: password
+        ? "Incorrect password. Please try again."
+        : "This link is password protected.",
+      password_required: true,
+      password_incorrect: !!password,
+      title: tokens.ogTitle || "Password required",
+      size: null,
+      size_str: null,
+      duration: null,
+      resolution: null,
+      thumbnail: tokens.ogImage,
+      download_url: null,
+      stream_url: null,
+      file_type: null,
+      files: [],
+    };
+  }
+
+  if (tokens.pageCookie) {
+    cookieHeader = mergeCookieHeaders(cookieHeader, tokens.pageCookie);
+  }
+
+  let apiResult = await callShareListWithVerificationRetry(tokens, cookieHeader, cookieNames);
+
+  // If share/list returns empty, try get_info fallback
+  if (apiResult?.data && (!apiResult.data.list || !apiResult.data.list.length)) {
+    const fallback = await callGetInfo(tokens, cookieHeader);
+    if (fallback?.data?.list?.length) {
+      apiResult = fallback;
+    }
+  }
+
+  // Definitive password required from API
+  if (apiResult?.error === "password_required") {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: password
+        ? "Incorrect password. Please try again."
+        : "This link is password protected.",
+      password_required: true,
+      password_incorrect: !!password,
+      title: tokens.ogTitle || "Password required",
+      size: null,
+      size_str: null,
+      duration: null,
+      resolution: null,
+      thumbnail: tokens.ogImage,
+      download_url: null,
+      stream_url: null,
+      file_type: null,
+      files: [],
+    };
+  }
+
+  if (apiResult?.error === "verification_required") {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: "TeraBox requires verification to access this link.",
+      verification_required: true,
+      title: tokens.ogTitle || "Verification required",
+      size: null,
+      size_str: null,
+      duration: null,
+      resolution: null,
+      thumbnail: tokens.ogImage,
+      download_url: null,
+      stream_url: null,
+      file_type: null,
+      files: [],
+    };
+  }
+
+  // API succeeded but returned no data, or non-password API error
+  if (!apiResult || apiResult.error === "api_error" || !apiResult.data) {
+    const parts = [];
+    if (apiResult?.errno != null) parts.push(`errno=${apiResult.errno}`);
+    if (apiResult?.errmsg) parts.push(apiResult.errmsg);
+    const detail = parts.length ? ` (${parts.join(", ")})` : "";
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: `TeraBox API did not return file data.${detail}`,
+_diagnostic: apiResult?._diagnostic,
+      title: tokens.ogTitle || "TeraBox File",
+      size: null,
+      size_str: null,
+      duration: null,
+      resolution: null,
+      thumbnail: tokens.ogImage,
+      download_url: null,
+      stream_url: null,
+      file_type: null,
+      files: [],
+    };
+  }
+
+  const rawFiles = apiResult.data.list;
+  if (!rawFiles || !rawFiles.length) {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: "No files found in the TeraBox share.",
+      title: tokens.ogTitle || "Empty",
+    };
+  }
+
+  const files = rawFiles.map((f) => normalizeFile(f, tokens));
+  const videoFiles = files.filter((f) => f.file_type === "video");
+  const primary = videoFiles.length ? videoFiles[0] : files[0];
+
+  // Try get_download API if we have modern tokens and fs_id
+  if (tokens.shareid && tokens.uk && tokens.sign && tokens.timestamp && primary.fs_id) {
+    const dlResult = await callGetDownload(tokens, primary.fs_id, cookieHeader);
+    if (dlResult?.dlink) {
+      primary.download_url = dlResult.dlink;
+      primary.stream_url = dlResult.dlink;
+    } else if (dlResult?.error === "verification_required") {
+      return {
+        ok: false,
+        source: "cf_worker",
+        error: "TeraBox requires verification to access this link.",
+        verification_required: true,
+        title: tokens.ogTitle || "Verification required",
+        size: null,
+        size_str: null,
+        duration: null,
+        resolution: null,
+        thumbnail: tokens.ogImage,
+        download_url: null,
+        stream_url: null,
+        file_type: null,
+        files: [],
+      };
+    } else if (dlResult?.error === "password_required") {
+      return {
+        ok: false,
+        source: "cf_worker",
+        error: password
+          ? "Incorrect password. Please try again."
+          : "This link is password protected.",
+        password_required: true,
+        password_incorrect: !!password,
+        title: tokens.ogTitle || "Password required",
+        size: null,
+        size_str: null,
+        duration: null,
+        resolution: null,
+        thumbnail: tokens.ogImage,
+        download_url: null,
+        stream_url: null,
+        file_type: null,
+        files: [],
+      };
+    }
+  }
+
+  // Fallback: resolve dlink from share/list
+  if (primary.download_url) {
+    const resolved = await resolveDlink(primary.download_url, cookieHeader);
+    primary.download_url = resolved;
+    primary.stream_url = resolved;
+  }
+
+  return {
+    ok: true,
+    source: "cf_worker",
+    title: tokens.ogTitle || primary.name,
+    size: primary.size,
+    size_str: primary.size_str,
+    duration: primary.duration,
+    resolution: primary.resolution,
+    thumbnail: primary.thumbnail || tokens.ogImage,
+    download_url: primary.download_url,
+    stream_url: primary.stream_url,
+    file_type: primary.file_type,
+    files,
+  };
+}
+
+async function handleResolve(surl, password, cookieJson) {
+  const normalizedSurl = canonicalShortUrl(surl);
+
+  const { names: cookieNames, cookieHeader: initialCookieHeader, cookieCount } = extractCookieNames(cookieJson);
+  let cookieHeader = initialCookieHeader;
+
+  const tokens = await fetchSharePage(normalizedSurl, password, cookieHeader);
+  if (!tokens) {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: "Could not fetch TeraBox share page or extract authentication tokens.",
+    };
+  }
+
+  if (tokens.error === "verification_required") {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: "TeraBox requires verification to access this link.",
+      verification_required: true,
+      title: tokens.ogTitle || "Verification required",
+      size: null,
+      size_str: null,
+      duration: null,
+      resolution: null,
+      thumbnail: tokens.ogImage,
+      download_url: null,
+      stream_url: null,
+      file_type: null,
+      files: [],
+    };
+  }
+
+  if (tokens.pageCookie) {
+    cookieHeader = mergeCookieHeaders(cookieHeader, tokens.pageCookie);
+  }
+
+  let apiResult = await callShareListWithVerificationRetry(tokens, cookieHeader, cookieNames);
+
+  if (apiResult?.data && (!apiResult.data.list || !apiResult.data.list.length)) {
+    const fallback = await callGetInfo(tokens, cookieHeader);
+    if (fallback?.data?.list?.length) {
+      apiResult = fallback;
+    }
+  }
+
+  if (apiResult?.error === "password_required") {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: password
+        ? "Incorrect password. Please try again."
+        : "This link is password protected.",
+      password_required: true,
+      password_incorrect: !!password,
+      title: tokens.ogTitle || "Password required",
+      size: null,
+      size_str: null,
+      duration: null,
+      resolution: null,
+      thumbnail: tokens.ogImage,
+      download_url: null,
+      stream_url: null,
+      file_type: null,
+      files: [],
+    };
+  }
+
+  if (apiResult?.error === "verification_required") {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: "TeraBox requires verification to access this link.",
+      verification_required: true,
+      title: tokens.ogTitle || "Verification required",
+      size: null,
+      size_str: null,
+      duration: null,
+      resolution: null,
+      thumbnail: tokens.ogImage,
+      download_url: null,
+      stream_url: null,
+      file_type: null,
+      files: [],
+    };
+  }
+
+  if (!apiResult || apiResult.error === "api_error" || !apiResult.data) {
+    const parts = [];
+    if (apiResult?.errno != null) parts.push(`errno=${apiResult.errno}`);
+    if (apiResult?.errmsg) parts.push(apiResult.errmsg);
+    const detail = parts.length ? ` (${parts.join(", ")})` : "";
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: `TeraBox API did not return file data.${detail}`,
+_diagnostic: apiResult?._diagnostic,
+      title: tokens.ogTitle || "TeraBox File",
+      size: null,
+      size_str: null,
+      duration: null,
+      resolution: null,
+      thumbnail: tokens.ogImage,
+      download_url: null,
+      stream_url: null,
+      file_type: null,
+      files: [],
+    };
+  }
+
+  const rawFiles = apiResult.data.list;
+  if (!rawFiles || !rawFiles.length) {
+    return {
+      ok: false,
+      source: "cf_worker",
+      error: "No files found in the TeraBox share.",
+      title: tokens.ogTitle || "Empty",
+    };
+  }
+
+  const files = rawFiles.map((f) => normalizeFile(f, tokens));
+  const videoFiles = files.filter((f) => f.file_type === "video");
+  const primary = videoFiles.length ? videoFiles[0] : files[0];
+
+  if (tokens.shareid && tokens.uk && tokens.sign && tokens.timestamp && primary.fs_id) {
+    const dlResult = await callGetDownload(tokens, primary.fs_id, cookieHeader);
+    if (dlResult?.dlink) {
+      primary.download_url = dlResult.dlink;
+      primary.stream_url = dlResult.dlink;
+    } else if (dlResult?.error === "verification_required") {
+      return {
+        ok: false,
+        source: "cf_worker",
+        error: "TeraBox requires verification to access this link.",
+        verification_required: true,
+        title: tokens.ogTitle || "Verification required",
+        size: null,
+        size_str: null,
+        duration: null,
+        resolution: null,
+        thumbnail: tokens.ogImage,
+        download_url: null,
+        stream_url: null,
+        file_type: null,
+        files: [],
+      };
+    } else if (dlResult?.error === "password_required") {
+      return {
+        ok: false,
+        source: "cf_worker",
+        error: password
+          ? "Incorrect password. Please try again."
+          : "This link is password protected.",
+        password_required: true,
+        password_incorrect: !!password,
+        title: tokens.ogTitle || "Password required",
+        size: null,
+        size_str: null,
+        duration: null,
+        resolution: null,
+        thumbnail: tokens.ogImage,
+        download_url: null,
+        stream_url: null,
+        file_type: null,
+        files: [],
+      };
+    }
+  }
+
+  if (primary.download_url) {
+    const resolved = await resolveDlink(primary.download_url, cookieHeader);
+    primary.download_url = resolved;
+    primary.stream_url = resolved;
+  }
+
+  const responseFiles = files.map((f) => ({
+    fs_id: f.fs_id,
+    name: f.name,
+    size: f.size,
+    size_str: f.size_str,
+    isdir: f.isdir,
+    path: f.path,
+    duration: f.duration,
+    resolution: f.resolution,
+    thumbnail: f.thumbnail,
+    download_url: f.download_url,
+    stream_url: f.stream_url,
+    file_type: f.file_type,
+  }));
+
+  return {
+    ok: true,
+    source: "cf_worker",
+    title: tokens.ogTitle || primary.name,
+    size: primary.size,
+    size_str: primary.size_str,
+    duration: primary.duration,
+    resolution: primary.resolution,
+    thumbnail: primary.thumbnail || tokens.ogImage,
+    download_url: primary.download_url,
+    stream_url: primary.stream_url,
+    file_type: primary.file_type,
+    files: responseFiles,
+    share_id: tokens.shareid,
+    uk: tokens.uk,
+    shorturl: tokens.surl,
+  };
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
+    if (request.method === "GET" && url.searchParams.get("mode") === "resolve") {
+      const surl = url.searchParams.get("surl");
+      const password = url.searchParams.get("pwd") || "";
+      const raw = url.searchParams.get("raw") === "1";
+
+      if (!surl) {
+        return new Response(
+          JSON.stringify({ ok: false, source: "cf_worker", error: "Missing required parameter: surl" }),
+          { status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
+        );
+      }
+
+      const cookieJson = env.COOKIE_JSON || "";
+      const result = await handleResolve(surl, password, cookieJson);
+
+      if (!result.ok) {
+        return new Response(JSON.stringify(result), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+
+      if (raw) {
+        return new Response(
+          JSON.stringify({ source: "live", upstream: result }),
+          { status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ source: "live", data: result }),
+        { status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }
+      );
+    }
+
+    if (request.method !== "POST") {
+      return new Response(JSON.stringify({ error: "Method not allowed" }), {
+        status: 405,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+
+    try {
+      const body = await request.json();
+      const { url, password } = body || {};
+
+      if (!url || typeof url !== "string") {
+        return new Response(JSON.stringify({ error: "Missing or invalid 'url' field" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        });
+      }
+
+      // Read COOKIE_JSON from environment
+      const cookieJson = env.COOKIE_JSON || "";
+      const result = await handleExtract(url, password || "", cookieJson);
+
+      return new Response(JSON.stringify(result), {
+        status: result.ok ? 200 : 200,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    } catch (err) {
+      return new Response(
+        JSON.stringify({ ok: false, source: "cf_worker", error: err.message || "Internal error" }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        }
+      );
+    }
+  },
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
